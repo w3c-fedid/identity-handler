@@ -6,9 +6,6 @@
 
 ## Participate
 - [Issue tracker — FedCM Issue #80](https://github.com/w3c-fedid/FedCM/issues/80)
-- [Design discussion — FedCM Issue #833](https://github.com/w3c-fedid/FedCM/issues/833)
-- [Spec PR #815](https://github.com/w3c-fedid/FedCM/pull/815)
-- [SW registration PR #834](https://github.com/w3c-fedid/FedCM/pull/834)
 
 ## Table of Contents
 
@@ -20,8 +17,9 @@
   - [Goals](#goals)
   - [Non-goals](#non-goals)
 - [Proposed Approach](#proposed-approach)
-  - [Dispatch model](#dispatch-model)
   - [Service Worker registration (UA / FedCM-managed)](#service-worker-registration-ua--fedcm-managed)
+  - [Dispatch model](#dispatch-model)
+  - [Flow (on each FedCM invocation)](#flow-on-each-fedcm-invocation)
   - [Selective endpoint policy](#selective-endpoint-policy)
   - [Transparent fallback](#transparent-fallback)
   - [Dependencies on non-stable features](#dependencies-on-non-stable-features)
@@ -73,15 +71,7 @@ The connection to the end user is partly indirect (these are security and reliab
 
 ## Proposed Approach
 
-We introduce an opt-in **Identity Handler** Service Worker, registered at the IDP origin, that the user agent invokes for FedCM's credentialed endpoints before going to the network. The handler is a normal Service Worker that listens for a single new event, `identityrequest`, and responds with a `Response` the way a `fetch` handler does.
-
-The full design is tracked in the FedCM repository ([spec PR #815](https://github.com/w3c-fedid/FedCM/pull/815)); the registration model is in [PR #834](https://github.com/w3c-fedid/FedCM/pull/834) and the [service worker model exploration](./service_worker_model.md). WebIDL for the new event lives in [Appendix A](#appendix-a-webidl-chromium--blink-form) so this section stays focused on behavior and example code.
-
-### Dispatch model
-
-When the browser needs to fetch a credentialed IDP endpoint (`accounts`, `id_assertion`, `disconnect`), it dispatches a purpose-built `identityrequest` event to the registered handler using the Service Worker spec's [_Fire Functional Event … on registration_](https://www.w3.org/TR/service-workers/#fire-functional-event) primitive — the same primitive [Payment Handler](https://w3c.github.io/web-based-payment-handler/) uses for the same shape of problem (a UA-initiated request, a destination-origin SW, and **no controlling client**). Because the request is sent over this trusted, FedCM-only path — not with the RP's [request client](https://fetch.spec.whatwg.org/#concept-request-client) — it does not reintroduce the generic cross-origin SW invocation that "foreign fetch" was removed to prevent ([Issue #833](https://github.com/w3c-fedid/FedCM/issues/833)).
-
-The handler reads `event.endpoint` to learn which credentialed call this is, inspects `event.request`, and calls `event.respondWith()` with a `Promise<Response>`. FedCM processes that response in a FedCM-specific way (e.g., parsing the accounts JSON) and feeds it into the existing FedCM internals.
+We introduce an opt-in **Identity Handler** Service Worker, registered at the IDP origin, that the user agent invokes for FedCM's credentialed endpoints before going to the network. The handler is a normal Service Worker that listens for a single new event, `identityrequest`, and responds with a `Response` the way a `fetch` handler does. WebIDL for the new event lives in [Appendix A](#appendix-a-webidl-chromium--blink-form) so this section stays focused on behavior and example code.
 
 ### Service Worker registration (UA / FedCM-managed)
 
@@ -104,14 +94,22 @@ The IDP declares the handler in **`/.well-known/web-identity`** using an `identi
 - The presence of `identity-handler` is the IDP's **opt-in** signal.
 - `service-worker` is the script URL the UA registers; `scope` is the registration scope.
 
+UA/FedCM-managed registration via the well-known `identity-handler` member is the current direction. A handful of operational sub-questions — onboarding already-signed-in users, forced bad-rollout recovery, behavior after storage eviction, and well-known fetch reliability — remain to be finalized.
+
+### Dispatch model
+
+When the browser needs to fetch a credentialed IDP endpoint (`accounts`, `id_assertion`, `disconnect`), it dispatches a purpose-built `identityrequest` event to the registered handler using the Service Worker spec's [_Fire Functional Event … on registration_](https://www.w3.org/TR/service-workers/#fire-functional-event) primitive (a UA-initiated request, a destination-origin SW, and **no controlling client**). Because the request is sent over this trusted, FedCM-only path — not with the RP's [request client](https://fetch.spec.whatwg.org/#concept-request-client) — it does not reintroduce the generic cross-origin SW invocation that "foreign fetch" was removed to prevent.
+
+The handler reads `event.endpoint` to learn which credentialed call this is, inspects `event.request`, and calls `event.respondWith()` with a `Promise<Response>`. FedCM processes that response in a FedCM-specific way (e.g., parsing the accounts JSON) and feeds it into the existing FedCM internals.
+
+### Flow (on each FedCM invocation)
+
 On each FedCM invocation the UA:
 
 1. Fetches the well-known and reads the `identity-handler` declaration.
 2. Runs _Match Service Worker Registration_ against a **FedCM-managed, isolated `StorageKey`** (nonce-based) so the FedCM registration can never collide with a page-initiated `navigator.serviceWorker.register()` for the same path.
 3. If a matching registration exists for the declared origin, `scope`, and `service-worker` URL, it dispatches the `identityrequest` event to it and schedules a [Soft Update](https://www.w3.org/TR/service-workers/#soft-update) **in parallel** (governed by HTTP cache freshness, so the IDP keeps its normal staged-rollout/rollback strategy).
 4. Otherwise it registers and activates the declared handler, then dispatches.
-
-> The registration mechanism is being finalized; UA/FedCM-managed registration via the well-known `identity-handler` member is the current direction ([PR #834](https://github.com/w3c-fedid/FedCM/pull/834), [service worker model](./service_worker_model.md)). A handful of operational sub-questions (onboarding already-signed-in users, forced bad-rollout recovery, behavior after storage eviction, and well-known fetch reliability) are tracked there.
 
 ### Selective endpoint policy
 
@@ -126,7 +124,7 @@ Only **credentialed** endpoints are dispatched to the handler. Configuration / d
 | `/config.json` | ❌ | Configuration — privacy protection |
 | `/client_metadata` | ❌ | RP metadata — privacy protection |
 
-This credentialed-endpoints-only scoping is the result of explicit attack analysis on [Issue #80](https://github.com/w3c-fedid/FedCM/issues/80) and cleared WG privacy review; the `client_metadata` exclusion was specifically confirmed in [Issue #833](https://github.com/w3c-fedid/FedCM/issues/833) (see [Privacy](#privacy)).
+This credentialed-endpoints-only scoping is the result of explicit attack analysis on [Issue #80](https://github.com/w3c-fedid/FedCM/issues/80) and cleared WG privacy review.
 
 ### Transparent fallback
 
@@ -134,8 +132,8 @@ If the handler does not call `respondWith()`, rejects the promise, returns a non
 
 ### Dependencies on non-stable features
 
-- The dispatch primitive ([_Fire Functional Event … on registration_](https://www.w3.org/TR/service-workers/#fire-functional-event)) is a stable Service Worker concept, already used by Payment Handler.
-- The new `identityrequest` event ([Appendix A](#appendix-a-webidl-chromium--blink-form)) and the UA-managed registration model are **new and not yet shipped**; they are being specified in [PR #815](https://github.com/w3c-fedid/FedCM/pull/815) and [PR #834](https://github.com/w3c-fedid/FedCM/pull/834).
+- The dispatch primitive ([_Fire Functional Event … on registration_](https://www.w3.org/TR/service-workers/#fire-functional-event)) is a stable Service Worker concept.
+- The new `identityrequest` event ([Appendix A](#appendix-a-webidl-chromium--blink-form)) and the UA-managed registration model are **new and not yet shipped**.
 
 ### Solving token-binding with this approach
 
@@ -256,18 +254,6 @@ Ship a FedCM-specific dispatch layer that bypasses _Handle Fetch_: look up the I
 #### Reason for rejection
 Silently overloading existing `fetch` handlers is risky, and the spec extension needed to dispatch a client-less `FetchEvent` was not endorsed.
 
-### Approach C — Dedicated `identityrequest` event (current direction)
-
-Introduce a purpose-built event the handler must explicitly listen for, dispatched via _Fire Functional Event … on registration_ — the same primitive Payment Handler uses.
-
-#### Pros
-- Makes the unusual dispatch model **explicit at the API surface**; pre-existing IDP `fetch` handlers are unaffected.
-- Adds exactly one FedCM-specific member (`endpoint`) and a FedCM-specific `respondWith()` processing model, while staying familiar to `FetchEvent` authors.
-- The trusted, FedCM-only request path — not the mere choice of a new event name — is what avoids reintroducing a generic cross-origin SW bypass ([Issue #833](https://github.com/w3c-fedid/FedCM/issues/833)).
-
-#### Reason for rejection
-Not rejected — **this is the proposed approach.**
-
 ### Registration shape — SW URL in `config.json` (backed out)
 
 Declaring the handler script inside `config.json` (e.g., `"identity_handler": { "service_worker": "/sw.js" }`).
@@ -290,55 +276,41 @@ This is a network-layer feature with **no UI surface of its own** and no user-vi
 - **No new information to the IDP.** The handler runs at the IDP origin and sees only what the IDP server already sees: `/accounts` (GET) reveals no RP identity (opaque origin); `/token` and `/disconnect` (POST) carry the RP `client_id` in the body, which the IDP server already receives.
 - **Consent is preserved.** The handler cannot bypass the FedCM consent UI; it only augments the network layer, and consent is required before any token is issued.
 - **Registration cannot leak the RP.** Declaring the handler in the RP-context-free well-known (not `config.json`) prevents encoding RP identity into the SW URL.
-- **Attacks considered** ([Issue #80](https://github.com/w3c-fedid/FedCM/issues/80), confirmed in [Issue #833](https://github.com/w3c-fedid/FedCM/issues/833)):
-  - _Attack A — RP iframes IDP, then invokes FedCM._ Browsers already partition SW-accessible storage by top-frame origin, so an iframed IDP cannot stash RP context a top-frame FedCM handler could read. **No new surface.**
-  - _Attack B — uncredentialed endpoint logs the RP, credentialed endpoint reads it._ If interception were enabled on `client_metadata`, the handler could record the RP identity and read it back during the `accounts` call, joining user + RP identity before consent. **Resolved** by restricting interception to credentialed endpoints only.
 
 ### Security
 
 - **Origin isolation.** The handler is registered at the IDP origin and can only intercept requests **to that origin**. Cross-origin interception is architecturally impossible.
-- **CSRF marker (resolved in [#833](https://github.com/w3c-fedid/FedCM/issues/833)).** The handler-initiated `fetch` does **not** propagate `Sec-Fetch-Dest: webidentity` (which would require an invasive Fetch-spec exception). IDP servers instead verify the source via `Sec-Fetch-Site: same-origin`, which the same-origin handler `fetch` carries reliably.
-- **Redirect prevention (resolved in [#833](https://github.com/w3c-fedid/FedCM/issues/833)).** FedCM requests use `redirect mode: "error"`. Requiring the handler to issue **same-origin** requests gives the same guarantee at the server layer, so a separate UA-side response-type filter is not required.
-- **Cookie scope (resolved in [#833](https://github.com/w3c-fedid/FedCM/issues/833)).** Reusing standard SW `fetch` semantics means the same-origin call carries the full IDP cookie jar (including `SameSite=Lax`/`Strict`), not only `SameSite=None`. This is acceptable because the cookies are already scoped to the IDP origin; FedCM-specific cookie exceptions were rejected as too invasive.
+- **CSRF marker.** The handler-initiated `fetch` does **not** propagate `Sec-Fetch-Dest: webidentity` (which would require an invasive Fetch-spec exception). IDP servers instead verify the source via `Sec-Fetch-Site: same-origin`, which the same-origin handler `fetch` carries reliably.
+- **Redirect prevention.** FedCM requests use `redirect mode: "error"`. Requiring the handler to issue **same-origin** requests gives the same guarantee at the server layer, so a separate UA-side response-type filter is not required.
+- **Cookie scope.** Reusing standard SW `fetch` semantics means the same-origin call carries the full IDP cookie jar (including `SameSite=Lax`/`Strict`), not only `SameSite=None`. This is acceptable because the cookies are already scoped to the IDP origin; FedCM-specific cookie exceptions were rejected as too invasive.
 - **Augmenting headers.** The handler may add headers (e.g., `DPoP`) but must **not** override UA-set headers (`Accept`, `Sec-Fetch-*`, `Cookie`, `Origin`, `Referer`). The exact allowlist and the process for growing it are still being finalized.
 - **Robust fallback.** The skip-flag pattern guarantees a handler failure degrades to the direct-network path rather than breaking sign-in.
 
 ## Stakeholder Feedback / Opposition
 
-- **FedCM editors / WG** : Engaged. Several design questions were **resolved** on the [23 Sept 2025 call](https://github.com/w3c-fedid/meetings/blob/main/2025/2025-09-23-FedCM-notes.md) and in [Issue #833](https://github.com/w3c-fedid/FedCM/issues/833) (dedicated event, relaxed response-type/cookie-scope invariants, `Sec-Fetch-Site` CSRF marker, `client_metadata` exclusion). SW registration remains under active discussion ([PR #834](https://github.com/w3c-fedid/FedCM/pull/834)).
-- **Service Worker editors** (Ben Kelly, Dominic Farolino, Yoshisato Yanagisawa) : Cautious. Rejected reusing a client-less `FetchEvent` (foreign-fetch concerns) and asked for formal spec/security/privacy/TAG review — shaping the dedicated-event direction.
+- **FedCM editors / WG** : Engaged. Several design questions have been **resolved** (dedicated event, relaxed response-type/cookie-scope invariants, `Sec-Fetch-Site` CSRF marker, `client_metadata` exclusion). The SW registration model remains under active discussion.
+- **Service Worker editors** : Cautious. Rejected reusing a client-less `FetchEvent` (foreign-fetch concerns) and asked for formal spec/security/privacy/TAG review — shaping the dedicated-event direction.
 - **Other browser engines** : No public signals yet.
 
 ## References & acknowledgements
 
-This proposal builds on discussion in [Issue #80](https://github.com/w3c-fedid/FedCM/issues/80), [Issue #833](https://github.com/w3c-fedid/FedCM/issues/833), the [WG meeting on 23 September 2025](https://github.com/w3c-fedid/meetings/blob/main/2025/2025-09-23-FedCM-notes.md), follow-up FedCM calls on [2 June 2026](https://github.com/w3c-fedid/meetings/blob/main/2026/2026-06-02-FedCM-notes.md#enabling-idp-interception-in-fedcm-request-815) and [9 June 2026](https://github.com/w3c-fedid/meetings/blob/main/2026/2026-06-09-FedCM-notes.md), and the [Chromium service-worker-discuss thread](https://groups.google.com/a/chromium.org/g/service-worker-discuss/c/t9d33x6l718).
-
-Many thanks for valuable feedback and advice from:
-
-- Ben Kelly
-- Dominic Farolino
-- FedCM editors and the WG privacy reviewer
-- Yoshisato Yanagisawa
+Many thanks for valuable feedback and advice from the FedCM editors, the Service Worker editors, and the WG privacy reviewer.
 
 Thanks to the following prior work that influenced this proposal:
 
 - [DPoP (RFC 9449)](https://www.rfc-editor.org/rfc/rfc9449)
-- [Payment Handler API](https://w3c.github.io/web-based-payment-handler/)
 - [Platform Authentication explainer (Microsoft Edge)](https://github.com/MicrosoftEdge/MSEdgeExplainers/blob/main/PlatformAuthentication/explainer.md)
 - [aaronpk's OAuth profile for FedCM](https://github.com/aaronpk/oauth-fedcm-profile), which framed the scope of the IDP-cookie bearer problem this proposal targets
 
-Specifications and related material:
+Specifications:
 
 - [FedCM Specification](https://fedidcg.github.io/FedCM/)
-- [Spec PR #815 — Enabling IDP Interception in FedCM Request](https://github.com/w3c-fedid/FedCM/pull/815)
-- [Spec PR #834 — Service Worker registration strategy](https://github.com/w3c-fedid/FedCM/pull/834)
-- [Service Worker model exploration](./service_worker_model.md)
 - [Service Worker Specification](https://w3c.github.io/ServiceWorker/)
 - [Fetch Specification](https://fetch.spec.whatwg.org/)
 
 ## Appendix A: WebIDL (Chromium / Blink form)
 
-The dedicated event ([Approach C](#approach-c--dedicated-identityrequest-event-current-direction)) is defined below in the Blink `.idl` form used in the Chromium tree — one definition per file, with the standard license header, a spec-link comment, an extended-attribute block (`RuntimeEnabled`, `Exposed`), `[CallWith=ScriptState]` on the constructor, `[SameObject]` on the `Request` attribute, and `[CallWith=ScriptState, RaisesException] void respondWith(...)` — modeled directly on [`fetch_event.idl`](https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/service_worker/fetch_event.idl) and [`payment_request_event.idl`](https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/payments/payment_request_event.idl).
+The dedicated event is defined below in the Blink `.idl` form used in the Chromium tree — one definition per file, with the standard license header, a spec-link comment, an extended-attribute block (`RuntimeEnabled`, `Exposed`), `[CallWith=ScriptState]` on the constructor, `[SameObject]` on the `Request` attribute, and `[CallWith=ScriptState, RaisesException] void respondWith(...)` — modeled directly on [`fetch_event.idl`](https://source.chromium.org/chromium/chromium/src/+/main:third_party/blink/renderer/modules/service_worker/fetch_event.idl).
 
 `third_party/blink/renderer/modules/credentialmanagement/identity_request_event.idl`
 
@@ -347,7 +319,7 @@ The dedicated event ([Approach C](#approach-c--dedicated-identityrequest-event-c
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// https://github.com/w3c-fedid/FedCM/pull/815
+// https://fedidcg.github.io/FedCM/
 [
     RuntimeEnabled=FedCmIdentityHandler,
     Exposed=ServiceWorker
@@ -367,7 +339,7 @@ The dedicated event ([Approach C](#approach-c--dedicated-identityrequest-event-c
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// https://github.com/w3c-fedid/FedCM/pull/815
+// https://fedidcg.github.io/FedCM/
 dictionary IdentityRequestEventInit : ExtendableEventInit {
     required IdentityRequestEndpoint endpoint;
     required Request request;
@@ -381,7 +353,7 @@ dictionary IdentityRequestEventInit : ExtendableEventInit {
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// https://github.com/w3c-fedid/FedCM/pull/815
+// https://fedidcg.github.io/FedCM/
 enum IdentityRequestEndpoint {
     "accounts",
     "id_assertion",
@@ -391,5 +363,5 @@ enum IdentityRequestEndpoint {
 
 > Notes
 > - `respondWith()` mirrors `FetchEvent`'s signature, but its `Promise<Response>` is processed in a **FedCM-specific** way (e.g., the accounts response is parsed as JSON and passed to FedCM internals).
-> - `[CallWith=ScriptState]` and `[RaisesException]` are **Blink IDL extended attributes** required by the Chromium implementation; they are not part of standard [Web IDL](https://webidl.spec.whatwg.org/) and are therefore dropped from the spec-facing IDL in [PR #815](https://github.com/w3c-fedid/FedCM/pull/815) (per [Issue #833](https://github.com/w3c-fedid/FedCM/issues/833)). Blink still uses `void` rather than the Web IDL `undefined` return type, which is reflected above.
+> - `[CallWith=ScriptState]` and `[RaisesException]` are **Blink IDL extended attributes** required by the Chromium implementation; they are not part of standard [Web IDL](https://webidl.spec.whatwg.org/) and are therefore dropped from the spec-facing IDL. Blink still uses `void` rather than the Web IDL `undefined` return type, which is reflected above.
 > - `RuntimeEnabled=FedCmIdentityHandler` gates the feature behind a flag declared in `runtime_enabled_features.json5`.
