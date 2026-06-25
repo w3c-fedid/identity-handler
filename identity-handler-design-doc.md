@@ -6,7 +6,7 @@
 
 Authors: sureshpotti@ (Microsoft Edge) — June 2026
 
-CL: [chromium-review #7974037](https://chromium-review.googlesource.com/c/chromium/src/+/7974037) — *[FedCM]: Add Identity Handler Service Worker interception*
+CL: [chromium-review #7961746](https://chromium-review.googlesource.com/c/chromium/src/+/7961746) — *[FedCM]: Add Identity Handler Service Worker interception*
 
 ---
 
@@ -67,7 +67,8 @@ editors.
   under an isolated, recomputable FedCM-managed `StorageKey`),
   `identity_request_event_dispatcher.{h,cc}` (dispatch the event to the SW and
   apply the timeout/fallback policy), `idp_network_request_manager.{h,cc}`
-  (per-IDP-origin handler state and SW-first-then-network routing of each
+  (per-handler-origin handler state, the `request_origin → handler_origin` map,
+  the pending-dispatch queue, and SW-first-then-network routing of each
   credentialed endpoint), and `accounts_fetcher.{h,cc}`.
 * **Mojo** (`fedcm_identity_request.mojom`): `IdentityRequestEndpoint` enum,
   `IdentityRequestEventData`, and the `IdentityRequestResponseCallback`
@@ -119,7 +120,7 @@ restricted to FedCM's credentialed endpoints and to the IDP's own origin.
 ### The dispatch model (the "handshake")
 
 ```
-IDP config.json:
+IDP /.well-known/web-identity:
   { ...,
     "identity_handler": { "service_worker": "/fedcm/sw.js" } }
 
@@ -136,17 +137,25 @@ Outcomes (per endpoint):
   (c) handler never calls respondWith()             → fall back to credentialed
                                                        network fetch.
   (d) no/!ready registration, worker fails to start → fall back to network.
+  (e) registration still in flight                  → park request, replay when
+                                                       registration settles.
 ```
+
+The handler service worker is declared in the well-known file and is
+**same-origin with it**, so its origin (the *handler origin*) is the
+registrable-domain apex (e.g. `idp.example`) in the common topology where the
+config and endpoints live on a subdomain (e.g. `accounts.idp.example`). The
+browser records how each request/endpoint origin maps onto the handler origin so
+credentialed requests can find the handler across that origin boundary.
 
 Only **credentialed** endpoints are dispatched. Configuration/discovery
 endpoints (`/.well-known/web-identity`, `config.json`, `client_metadata`) stay
 UA-direct to preserve FedCM's privacy boundary.
 
-> **Note (current patchset):** registration is driven from the IDP's
-> `config.json` `identity_handler.service_worker` member. The explainer's
-> longer-term direction is UA/FedCM-managed registration declared in
-> `/.well-known/web-identity` (RP-context-free); that migration is tracked
-> separately and does not change the dispatch/runtime design below.
+> **Note:** registration is declared in the IDP's `/.well-known/web-identity`
+> `identity_handler.service_worker` member. The well-known is an RP-context-free
+> source fetched UA-direct, so RP identity is never encoded into the SW URL, and
+> the well-known itself is never dispatched to the handler.
 
 ### Data flow (threads / processes / network)
 
@@ -167,33 +176,59 @@ never called.
 **In the browser process (the trust boundary; all decisions live here, on the UI
 thread).**
 
-1. **Registration.** `IdentityHandlerServiceWorkerManager::Register(sw_url)`
-   registers the SW with scope `sw_url.GetWithoutFilename()` under an
-   **isolated, FedCM-managed `StorageKey`** returned by
-   `GetFedCmStorageKey(idp_origin)` — a nonce-based key whose nonce is derived
-   deterministically (SHA-1 over `"fedcm-identity-handler-v1:" + origin` → a
-   `base::UnguessableToken` → `StorageKey::CreateWithNonce`). Because page
-   JavaScript can only register into a first-party key, this FedCM partition is
-   unreachable from the page, so the FedCM registration can never collide with —
-   or clobber — the IDP's ordinary site-wide Service Workers; and because the
-   key is recomputed from the IDP origin, no per-instance state has to be
-   persisted to find it again later. On success it finds the ready
-   registration and calls
-   `IdpNetworkRequestManager::SetIdentityHandlerDispatcher(idp_origin,
-   dispatcher, sw_context, registration_id)`, recording
-   `Blink.FedCm.IdentityHandler.Registered`. Registration failure simply
-   proceeds without interception (graceful no-op).
-2. **Per-IDP routing state.** `IdpNetworkRequestManager` keeps a
-   `flat_map<url::Origin, IdentityHandlerState>` where each
-   `IdentityHandlerState` holds `{ dispatcher, sw_context, registration_id }`.
-   FedCM supports multiple IDPs per request, so handler state is **keyed by IDP
-   origin**; an IDP without a handler falls through to the network.
-3. **Dispatch.** For a credentialed endpoint to `idp_origin`, if a handler state
+1. **Registration (parallel, non-blocking).** When the well-known declares
+   `identity_handler.service_worker`, the SW is registered *while* the accounts
+   fetch proceeds, so the worker is more likely to be ready by the time a
+   credentialed request is dispatched. The SW is declared in — and validated
+   same-origin with — the well-known file, so the well-known origin is the
+   **handler origin**; in the common FedCM topology this is the
+   registrable-domain apex (`idp.example`) while the config/endpoints live on a
+   subdomain (`accounts.idp.example`). Before issuing the accounts request,
+   `IdpNetworkRequestManager::NotifyIdentityHandlerRegistrationStarted(request_origin,
+   handler_origin)` records the `request_origin → handler_origin` mapping and
+   marks the handler state `registration_pending`.
+   `IdentityHandlerServiceWorkerManager::Register(sw_url, handler_origin)` then
+   registers the SW with scope `sw_url.GetWithoutFilename()` under an **isolated,
+   FedCM-managed `StorageKey`** returned by `GetFedCmStorageKey(handler_origin)`
+   — a nonce-based key whose nonce is derived deterministically (SHA-1 over
+   `"fedcm-identity-handler-v1:" + origin` → a `base::UnguessableToken` →
+   `StorageKey::CreateWithNonce`). Because page JavaScript can only register into
+   a first-party key, this FedCM partition is unreachable from the page, so the
+   FedCM registration can never collide with — or clobber — the IDP's ordinary
+   site-wide Service Workers; and because the key is recomputed from the handler
+   origin, no per-instance state has to be persisted to find it again later. On
+   success it finds the ready registration and calls
+   `SetIdentityHandlerDispatcher(handler_origin, dispatcher, sw_context,
+   registration_id)` — which installs the dispatcher and **flushes any parked
+   requests** (step 3) — recording `Blink.FedCm.IdentityHandler.Registered`.
+   Registration failure calls
+   `NotifyIdentityHandlerRegistrationFailed(handler_origin)` and proceeds without
+   interception (graceful no-op).
+2. **Per-handler routing state.** `IdpNetworkRequestManager` keeps a
+   `flat_map<url::Origin, IdentityHandlerState>` keyed by **handler origin**,
+   where each `IdentityHandlerState` holds
+   `{ dispatcher, sw_context, registration_id, registration_pending,
+   pending_dispatches }`, plus a `request_origin → handler_origin` map. Because a
+   credentialed request only carries its config/endpoint origin,
+   `ResolveIdentityHandlerOrigin(request_origin)` maps it onto the handler origin
+   before any lookup. FedCM supports multiple IDPs per request, so state is keyed
+   per handler origin; a request whose origin maps to no handler falls through to
+   the network.
+3. **Dispatch (with pending queue).** For a credentialed endpoint, the manager
+   resolves the handler origin and then: (a) if registration is still in flight
+   (`registration_pending`), it **parks** the request as a closure in
+   `pending_dispatches` and replays it once registration settles, rather than
+   racing to the network and bypassing the handler; (b) if a ready dispatcher
    exists, `IdentityRequestEventDispatcher::DispatchIdentityRequestEvent` calls
    `FindReadyRegistrationForIdOnly(registration_id)`, then
    `RunAfterStartWorker(IDENTITY_REQUEST, …)`, then
    `active_version->endpoint()->DispatchIdentityRequestEvent(event_data,
-   response_callback, …)`. The response callback is a self-owned Mojo receiver.
+   response_callback, …)` (response callback is a self-owned Mojo receiver),
+   recording `Blink.FedCm.IdentityHandler.Dispatched`; (c) otherwise it falls
+   back to a credentialed network fetch. `FlushPendingIdentityHandlerDispatches`
+   (invoked on both registration success and failure) drains the parked queue:
+   on success the replayed requests find a ready dispatcher, on failure they fall
+   back to the network.
 4. **Timeout & fallback.** A delayed task (default **10 s**) closes the Mojo pipe
    if `respondWith()` has not settled; closing destroys the response-callback
    impl, whose destructor fires `kRespondWithFailed` and adds a console warning.
@@ -201,16 +236,17 @@ thread).**
    `kNotHandled` / `kNoRegistration` / `kNoActiveVersion` / `kWorkerStartFailed`
    → **fall back** to a credentialed network fetch
    (`Blink.FedCm.IdentityHandler.FellBackToNetwork`); `kRespondWithFailed` →
-   **fail** the request without falling back. Successful dispatch records
-   `Blink.FedCm.IdentityHandler.Dispatched`.
-5. **Unregistration.** `Unregister(idp_origin)` is fire-and-forget: it
-   recomputes the FedCM-managed `StorageKey` from `idp_origin`, enumerates the
-   registrations under that key (`GetRegistrationsForStorageKey`), and removes
-   them all. Every registration in that partition was created by FedCM
-   (page-initiated registrations live in the IDP's first-party key and can never
-   land there), so legitimate non-FedCM Service Workers are never touched — and
-   because the key is recomputed rather than read from per-instance state,
-   cleanup works even from a freshly constructed manager in a later FedCM flow.
+   **fail** the request without falling back.
+5. **Unregistration.** When a later flow's well-known no longer declares an
+   identity handler, `Unregister(handler_origin)` (derived from the well-known
+   URL) is fire-and-forget: it recomputes the FedCM-managed `StorageKey` from the
+   handler origin, enumerates the registrations under that key
+   (`GetRegistrationsForStorageKey`), and removes them all. Every registration in
+   that partition was created by FedCM (page-initiated registrations live in the
+   IDP's first-party key and can never land there), so legitimate non-FedCM
+   Service Workers are never touched — and because the key is recomputed rather
+   than read from per-instance state, cleanup works even from a freshly
+   constructed manager in a later FedCM flow.
 
 **Over Mojo.** `IdentityRequestEventData` (endpoint, request_url, optional
 request_body, request_method) flows browser→renderer;
@@ -223,12 +259,16 @@ renderer→browser.
   reports the `respondWith()` outcome; it makes **no** trust or fallback
   decision and cannot reach configuration/discovery endpoints.
 * **`IdentityHandlerServiceWorkerManager`** owns SW lifecycle (register on
-  opt-in under an isolated FedCM-managed `StorageKey`, stateless recomputable
-  unregister) and wires the dispatcher into the network manager keyed by IDP
-  origin.
+  opt-in under an isolated FedCM-managed `StorageKey` keyed by the handler
+  origin, stateless recomputable unregister) and wires the dispatcher into the
+  network manager. It is scoped to the frame's storage partition (per-profile)
+  and instances are keyed by IDP config URL so concurrent multi-IDP
+  registrations don't destroy each other's in-flight managers.
 * **`IdpNetworkRequestManager` + `IdentityRequestEventDispatcher`** own routing
-  (per-origin state), worker startup, the timeout, and the
-  fail-vs-fall-back-vs-network decision for every credentialed endpoint.
+  (per-handler-origin state plus the `request_origin → handler_origin` map),
+  the pending-dispatch queue for in-flight registrations, worker startup, the
+  timeout, and the fail-vs-fall-back-vs-network decision for every credentialed
+  endpoint.
 
 ### Key property: handler failures never block authentication
 
@@ -269,11 +309,10 @@ and the `kFedCmIdentityHandler` base feature; no Finch experiment is defined yet
 
 ## Rollout plan
 
-Prototype behind flags (off by default). Not targeting a milestone yet. The
-registration mechanism is expected to migrate from `config.json` to a
-UA/FedCM-managed `/.well-known/web-identity` declaration before any broader
-rollout. Any future rollout would be experiment-controlled (Origin Trial or other
-staged mechanism).
+Prototype behind flags (off by default). Not targeting a milestone yet.
+Registration is declared in the IDP's `/.well-known/web-identity` and the SW is
+held under a UA/FedCM-managed `StorageKey`. Any future rollout would be
+experiment-controlled (Origin Trial or other staged mechanism).
 
 ---
 
@@ -283,10 +322,11 @@ staged mechanism).
 
 Work is added only when an IDP declares `identity_handler` and the flag is on:
 one SW registration lookup, worker start (amortized by Soft Update / SW
-lifetime), and a per-endpoint event dispatch with a bounded 10 s timeout. Zero
-added work on the hot path of a FedCM flow with no handler or when the flag is
-off. A handler that augments headers and re-fetches adds one same-origin network
-round trip versus the direct fetch it replaces.
+lifetime, and kicked off **in parallel with the accounts fetch** so it is likely
+ready by dispatch time), and a per-endpoint event dispatch with a bounded 10 s
+timeout. Zero added work on the hot path of a FedCM flow with no handler or when
+the flag is off. A handler that augments headers and re-fetches adds one
+same-origin network round trip versus the direct fetch it replaces.
 
 ### Simplicity
 
@@ -303,13 +343,14 @@ unchanged).
 Threat model: the goal is to give the IDP a seam on **its own** credentialed
 FedCM path without weakening FedCM's privacy boundary or sign-in reliability.
 
-* **Origin isolation.** The handler is registered at the IDP origin under an
-  isolated, FedCM-managed (nonce-based) `StorageKey` and can only ever see
-  requests destined for **its own origin**; cross-origin interception is
-  architecturally impossible. The isolated key keeps FedCM's registration in a
-  partition page JavaScript cannot reach, so it never collides with or clobbers
-  the IDP's first-party Service Workers. State is keyed per IDP origin so one
-  IDP's handler cannot observe another's requests.
+* **Origin isolation.** The handler is registered at the **handler origin** (the
+  well-known origin, with which the SW script is same-origin) under an isolated,
+  FedCM-managed (nonce-based) `StorageKey`, and can only ever see requests
+  destined for that origin; cross-origin interception is architecturally
+  impossible. The isolated key keeps FedCM's registration in a partition page
+  JavaScript cannot reach, so it never collides with or clobbers the IDP's
+  first-party Service Workers. State is keyed per handler origin so one IDP's
+  handler cannot observe another's requests.
 * **Selective scope.** Only credentialed endpoints (`accounts`, `id_assertion`,
   `disconnect`) are dispatched; `/.well-known`, `config.json`, and
   `client_metadata` are never exposed to the handler, so it cannot correlate
@@ -335,8 +376,7 @@ reveals no RP identity (opaque origin); `id_assertion`/`disconnect` (POST) carry
 the RP `client_id` in the body, which the IDP server already receives. Excluding
 the configuration/discovery endpoints prevents the handler from learning *which
 RP* the user is interacting with. Driving registration from an RP-context-free
-source (the well-known, in the target design) prevents encoding RP identity into
-the SW URL.
+source (the well-known) prevents encoding RP identity into the SW URL.
 
 ---
 
@@ -355,17 +395,18 @@ the SW URL.
   `same-origin.https.html` (handler intercepts and responds),
   `cross-origin.https.html` (cross-origin requests are not intercepted),
   `respond-with-failure.https.html` (rejection/timeout fail without fallback),
-  plus the `support/` manifest, registration page, and sample handler SW. A
-  `virtual/fedcm-identity-handler/` suite runs these with the feature enabled.
+  plus the `support/` test well-known (`.well-known/web-identity`), the
+  `manifest_with_identity_handler.py` generator, the `fedcm-helper.sub.js`
+  helpers, and a sample handler SW. A `virtual/fedcm-identity-handler/` suite
+  runs these with the feature enabled.
 
 ---
 
 ## Followup work
 
-* Migrate registration to UA/FedCM-managed `/.well-known/web-identity`
-  declaration and resolve the open operational sub-questions (onboarding
-  already-signed-in users, forced bad-rollout recovery, behavior after storage
-  eviction, well-known fetch reliability).
+* Resolve the open operational sub-questions around the well-known-driven
+  registration (onboarding already-signed-in users, forced bad-rollout recovery,
+  behavior after storage eviction, well-known fetch reliability).
 * Finalize the header-augmentation allowlist and the process for growing it.
 * Standards work: dedicated-event spec text, security/privacy and TAG review, and
   cross-vendor signals.
