@@ -110,8 +110,6 @@ restricted to FedCM's credentialed endpoints and to the IDP's own origin.
 
 ### Links
 
-* Explainer: `identity-handler-explainer.md` (this repo).
-* Spec draft (Bikeshed): `index.bs` (this repo).
 * Discussion: [FedCM Issue #80](https://github.com/w3c-fedid/FedCM/issues/80).
 * FedCM: <https://fedidcg.github.io/FedCM/> · Service Worker:
   <https://w3c.github.io/ServiceWorker/> · Fetch:
@@ -271,15 +269,6 @@ renderer→browser.
   timeout, and the fail-vs-fall-back-vs-network decision for every credentialed
   endpoint.
 
-### Key property: handler failures never block authentication
-
-Sign-in must not become *less* reliable than today. Every path that is not a
-clean valid `Response` either falls back to the existing direct-network FedCM
-fetch (no registration, worker won't start, `respondWith()` not called) or fails
-the single request deterministically (`respondWith()` rejected/timed-out/invalid)
-— and the configuration/discovery endpoints bypass the handler entirely. The
-handler is therefore strictly additive to FedCM's existing flow.
-
 ---
 
 ## Metrics
@@ -356,13 +345,6 @@ FedCM path without weakening FedCM's privacy boundary or sign-in reliability.
   `disconnect`) are dispatched; `/.well-known`, `config.json`, and
   `client_metadata` are never exposed to the handler, so it cannot correlate
   user identity with RP identity.
-* **CSRF / redirect.** The handler-initiated `fetch` is same-origin and carries
-  `Sec-Fetch-Site: same-origin`, which IDP servers verify; requiring same-origin
-  requests preserves FedCM's `redirect mode: "error"` guarantee at the server
-  layer.
-* **Header augmentation.** The handler may add headers (e.g., `DPoP`) but must
-  not override UA-set headers (`Accept`, `Sec-Fetch-*`, `Cookie`, `Origin`,
-  `Referer`); the allowlist is being finalized.
 * **No consent bypass.** The handler operates only on the network layer; FedCM
   consent is still required before any token is issued.
 * **Robust fallback.** The timeout + skip/fallback pattern guarantees a handler
