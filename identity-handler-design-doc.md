@@ -405,10 +405,6 @@ source (the well-known) prevents encoding RP identity into the SW URL.
 
 ## Followup work
 
-* Resolve the open operational sub-questions around the well-known-driven
-  registration (onboarding already-signed-in users, forced bad-rollout recovery,
-  behavior after storage eviction, well-known fetch reliability).
-* Finalize the header-augmentation allowlist and the process for growing it.
 * Standards work: dedicated-event spec text, security/privacy and TAG review, and
   cross-vendor signals.
 
