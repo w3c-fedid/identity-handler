@@ -188,8 +188,9 @@ thread).**
    handler_origin)` records the `request_origin → handler_origin` mapping and
    marks the handler state `registration_pending`.
    `IdentityHandlerServiceWorkerManager::Register(sw_url, handler_origin)` then
-   registers the SW under an **isolated, FedCM-managed `StorageKey`** returned by
-   `GetFedCmStorageKey(handler_origin)`
+   registers the SW with scope `sw_url.GetWithoutFilename()` (the default scope
+   derived from the script URL) under an **isolated, FedCM-managed `StorageKey`**
+   returned by `GetFedCmStorageKey(handler_origin)`
    — a nonce-based key whose nonce is derived deterministically (SHA-1 over
    `"fedcm-identity-handler-v1:" + origin` → a `base::UnguessableToken` →
    `StorageKey::CreateWithNonce`). Because page JavaScript can only register into

@@ -77,7 +77,7 @@ We introduce an opt-in **Identity Handler** Service Worker, registered at the ID
 
 Registration is **UA-managed (FedCM-managed)**: the user agent — not a script on an IDP page — registers and maintains the handler. This matters because a signed-in IDP session can stay valid for weeks or months (Entra allows up to ~90 days), during which FedCM keeps making credentialed calls without the user ever revisiting an IDP page. A page-script registration would not reliably exist when needed.
 
-The IDP declares the handler in **`/.well-known/web-identity`** using an `identity-handler` member with `service-worker` and `scope` members:
+The IDP declares the handler in **`/.well-known/web-identity`** using an `identity-handler` member with a `service-worker` member:
 
 ```json
 {
@@ -85,14 +85,13 @@ The IDP declares the handler in **`/.well-known/web-identity`** using an `identi
     "https://idp.example/fedcm/config.json"
   ],
   "identity-handler": {
-    "service-worker": "/fedcm/sw.js",
-    "scope": "/fedcm/"
+    "service-worker": "/fedcm/sw.js"
   }
 }
 ```
 
 - The presence of `identity-handler` is the IDP's **opt-in** signal.
-- `service-worker` is the script URL the UA registers; `scope` is the registration scope.
+- `service-worker` is the script URL the UA registers.
 
 UA/FedCM-managed registration via the well-known `identity-handler` member is the current direction. A handful of operational sub-questions — onboarding already-signed-in users, forced bad-rollout recovery, behavior after storage eviction, and well-known fetch reliability — remain to be finalized.
 
@@ -108,7 +107,7 @@ On each FedCM invocation the UA:
 
 1. Fetches the well-known and reads the `identity-handler` declaration.
 2. Runs _Match Service Worker Registration_ against a **FedCM-managed, isolated `StorageKey`** (nonce-based) so the FedCM registration can never collide with a page-initiated `navigator.serviceWorker.register()` for the same path.
-3. If a matching registration exists for the declared origin, `scope`, and `service-worker` URL, it dispatches the `identityrequest` event to it and schedules a [Soft Update](https://www.w3.org/TR/service-workers/#soft-update) **in parallel** (governed by HTTP cache freshness, so the IDP keeps its normal staged-rollout/rollback strategy).
+3. If a matching registration exists for the declared origin and `service-worker` URL, it dispatches the `identityrequest` event to it and schedules a [Soft Update](https://www.w3.org/TR/service-workers/#soft-update) **in parallel** (governed by HTTP cache freshness, so the IDP keeps its normal staged-rollout/rollback strategy).
 4. Otherwise it registers and activates the declared handler, then dispatches.
 
 ### Selective endpoint policy

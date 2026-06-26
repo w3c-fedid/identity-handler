@@ -1329,7 +1329,6 @@ dictionary IdentityProviderWellKnown {
 
 dictionary IdentityHandler {
   required USVString service_worker;
-  USVString scope;
 };
 
 dictionary IdentityProviderIcon {
@@ -2064,9 +2063,8 @@ created registration when the [=IDP=] opts out.
         {{ServiceWorkerContainer/register()|navigator.serviceWorker.register()}} for the same scope.
     1. If |wellKnown| declares an {{IdentityProviderWellKnown/identity_handler}}:
         1. Let |handler| be |wellKnown|["{{IdentityProviderWellKnown/identity_handler}}"].
-        1. Let |scopeUrl| be |handler|["{{IdentityHandler/scope}}"] if present, or otherwise the
-            default scope derived from |handler|["{{IdentityHandler/service_worker}}"] as defined in
-            [[!SERVICE-WORKERS]].
+        1. Let |scopeUrl| be the default scope derived from
+            |handler|["{{IdentityHandler/service_worker}}"] as defined in [[!SERVICE-WORKERS]].
         1. Let |registration| be the result of running <a spec=service-workers>Match Service Worker
             Registration</a> given |storageKey| and |scopeUrl| [[!SERVICE-WORKERS]].
         1. If |registration| is not null and its [=/service worker registration=] was created from a
@@ -2396,7 +2394,7 @@ The {{IdentityProviderWellKnown}} JSON object has the following semantics:
     :   <dfn>identity_handler</dfn>
     ::  An optional {{IdentityHandler}} declaration. Its presence is the [=IDP=]'s opt-in to
         [=/service worker=]-based interception of credentialed FedCM requests, and it tells the
-        [=user agent=] which [=/service worker=] script to register and under which scope. See
+        [=user agent=] which [=/service worker=] script to register. See
         [[#identity-handler-trust]] and [[#idp-guidance]].
 </dl>
 
@@ -2406,10 +2404,6 @@ The {{IdentityHandler}} JSON object has the following semantics:
     :   <dfn>service_worker</dfn>
     ::  A URL, resolved against the [=IDP=]'s [=/origin=], of the [=/service worker=] script that the
         [=user agent=] registers and dispatches {{IdentityRequestEvent}}s to.
-    :   <dfn>scope</dfn>
-    ::  An optional registration scope for the [=/service worker=], resolved against the [=IDP=]'s
-        [=/origin=]. If omitted, the [=user agent=] uses the default scope derived from
-        {{IdentityHandler/service_worker}} as defined in [[!SERVICE-WORKERS]].
 </dl>
 
 Either {{IdentityProviderWellKnown/provider_urls}} or both
@@ -3384,7 +3378,7 @@ register the [=/service worker=] from a page via
 matters because a signed-in [=IDP=] session can remain valid for long periods
 during which no [=IDP=] page is visited.
 
-**Declaration.** The [=IDP=] declares the [=/service worker=] script and scope in
+**Declaration.** The [=IDP=] declares the [=/service worker=] script in
 `/.well-known/web-identity`:
 
 <div class=example>
@@ -3392,8 +3386,7 @@ during which no [=IDP=] page is visited.
 {
   "provider_urls": ["https://idp.example/fedcm/config.json"],
   "identity_handler": {
-    "service_worker": "/fedcm/sw.js",
-    "scope": "/fedcm/"
+    "service_worker": "/fedcm/sw.js"
   }
 }
 ```
@@ -3426,11 +3419,11 @@ If the [=/service worker=] does not call {{IdentityRequestEvent/respondWith()}} 
 {{IdentityRequestEvent/endpoint}}, the [=user agent=] falls back to the default credentialed
 fetch for that endpoint.
 
-**Scope selection.** The declared {{IdentityHandler/scope}} should cover the URLs of the
-credentialed endpoints declared in the [=config file=] (accounts, id-assertion, disconnect).
-Because the [=user agent=] locates the [=/service worker=] by running
-<a spec=service-workers>Match Service Worker Registration</a> against each endpoint URL, the
-scope-prefix matching rules of [[!SERVICE-WORKERS]] apply.
+**Script placement.** The [=/service worker=] script's path determines its default
+registration scope, which should cover the URLs of the credentialed endpoints declared in the
+[=config file=] (accounts, id-assertion, disconnect). Because the [=user agent=] locates the
+[=/service worker=] by running <a spec=service-workers>Match Service Worker Registration</a>
+against each endpoint URL, the scope-prefix matching rules of [[!SERVICE-WORKERS]] apply.
 </div>
 
 <!-- ============================================================ -->
