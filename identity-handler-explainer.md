@@ -13,7 +13,6 @@
 ## Table of Contents
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
-<!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
 - [Introduction](#introduction)
 - [User-Facing Problem](#user-facing-problem)
@@ -35,6 +34,8 @@
 - [Accessibility, Internationalization, Privacy, and Security Considerations](#accessibility-internationalization-privacy-and-security-considerations)
 - [Stakeholder Feedback / Opposition](#stakeholder-feedback--opposition)
 - [References & acknowledgements](#references--acknowledgements)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
 
 ## Introduction
 
@@ -97,7 +98,7 @@ The IDP declares the handler in **`/.well-known/web-identity`** using an `identi
 ```
 
 - The presence of `identity_handler` is the IDP's **opt-in** signal.
-- `service_worker` is the script URL the UA registers; it MUST be same-origin with the well-known file. The UA derives the registration scope from it (the script URL with its last path segment removed).
+- `service_worker` is the script URL the UA registers; it MUST be same-origin with the well-known file, so that an attacker who controls a different subdomain of the IDP cannot register a handler for this origin. The UA derives the registration scope from it (the script URL with its last path segment removed).
 - There is no separate `enabled` switch: an IDP disables interception by **removing the `identity_handler` member**, which causes the UA to unregister the handler and use the direct-network path.
 
 UA/FedCM-managed registration via the well-known `identity_handler` member is the current direction.
@@ -119,7 +120,9 @@ On each FedCM invocation the UA:
 3. If a matching registration exists for the declared origin and `service_worker` URL, it dispatches the `identityrequest` event to it and schedules a [Soft Update](https://www.w3.org/TR/service-workers/#soft-update) **in parallel** (governed by HTTP cache freshness, so the IDP keeps its normal staged-rollout/rollback strategy).
 4. Otherwise it registers and activates the declared handler, then dispatches.
 
-Because the isolated `StorageKey` is ordinary storage for the IDP origin, clearing the IDP's site data (e.g., via `Clear-Site-Data`) removes the handler registration along with the IDP's other Service Workers; no FedCM-specific unregistration mechanism is required.
+Because the isolated `StorageKey` is keyed to the IDP origin, clearing the IDP's site data (e.g., via `Clear-Site-Data`) is expected to also clear the isolated FedCM partition, though the spec text should mandate this explicitly since the partition is otherwise UA-only. No FedCM-specific unregistration mechanism is required.
+
+To keep handler add/remove latency low, IDPs SHOULD serve `/.well-known/web-identity` with a short `Cache-Control: max-age` (e.g., no more than 5 minutes). Because Step 1 re-reads the well-known on each FedCM invocation subject to normal HTTP caching, this bounds how quickly adding or removing the `identity_handler` member takes effect. It complements the SW Soft Update flow (which recovers a broken script) by covering the case of pulling the handler entirely.
 
 ### Selective endpoint policy
 
@@ -141,7 +144,7 @@ This credentialed-endpoints-only scoping is the result of explicit attack analys
 The UA distinguishes two outcomes:
 
 - **Not handled → transparent fallback.** If no handler is registered, the worker cannot be started, or the handler returns without calling `respondWith()`, the browser falls back to a normal network fetch using a "skip flag" pattern: emit a console warning, set a `skip_identity_handler` flag, re-issue the same request UA-direct, then clear the flag. This is the expected path for endpoints a handler chooses not to intercept.
-- **Handled but failed → hard failure (no fallback).** If the handler calls `respondWith()` but the promise rejects, resolves with an invalid or non-OK response, exceeds the response-body cap, or times out (the UA MAY enforce an implementation-defined timeout; the prototype uses 10 seconds), the FedCM request **fails without falling back**. This mirrors `FetchEvent.respondWith()` in the Service Worker spec and ensures a handler that has claimed a request cannot be silently bypassed; otherwise a broken or hostile handler could mask a security-relevant failure by having FedCM quietly retry unaugmented.
+- **Handled but failed → hard failure (no fallback).** If the handler calls `respondWith()` but the promise rejects, resolves with an invalid or non-OK response, exceeds the response-body cap, or does not settle within an implementation-defined timeout (the prototype uses 10 seconds), the FedCM request **fails without falling back**. This mirrors `FetchEvent.respondWith()` in the Service Worker spec and ensures a handler that has claimed a request cannot be silently bypassed; the timeout is required (its duration is implementation-defined) so a handler that never settles its promise cannot hang the FedCM flow indefinitely.
 
 ### Dependencies on non-stable features
 
@@ -280,7 +283,7 @@ Silently overloading existing `fetch` handlers is risky, and the spec extension 
 - It was **removed from the web platform** precisely because a client-less, cross-origin SW-invocation surface proved hard to reason about and secure (Ben Kelly, on the [Chromium service-worker-discuss thread](https://groups.google.com/a/chromium.org/g/service-worker-discuss/c/t9d33x6l718)).
 
 #### Reason for rejection
-Reviving a client-less *cross-origin* invocation path is a non-starter. Identity Handler deliberately avoids it: the intercepted request is **same-origin** with the IDP (never cross-origin), and dispatch is a UA-only, FedCM-specific path keyed to an isolated registration, not a general-purpose surface any origin can trigger. This distinction is exactly why a dedicated `identityrequest` event, rather than a reused `FetchEvent`, is the chosen design.
+Reviving a client-less *cross-origin* invocation path is a non-starter. Identity Handler deliberately avoids it: the intercepted request is **same-origin** with the IDP (never cross-origin), and the trigger for dispatch is a UA-initiated FedCM call for that specific IDP, not an arbitrary cross-origin fetch that any origin can issue. Dispatch is a UA-only, FedCM-specific path keyed to an isolated registration, not a general-purpose surface. This distinction is exactly why a dedicated `identityrequest` event, rather than a reused `FetchEvent`, is the chosen design.
 
 ### A dedicated worklet or one-off worker
 
@@ -291,6 +294,7 @@ Run the augmentation logic in a worklet (à la Audio/Paint worklets, or a hypoth
 
 #### Cons
 - Worklets and dedicated workers have **no registration, lifecycle, or request-interception model**, and do not exist unless a page spins them up. FedCM's defining requirement is augmenting credentialed calls **weeks or months after the IDP page was last open**, when there is no page to create the worklet/worker.
+- Worklets further lack `fetch()`, the Cache API, and IndexedDB, which the handler needs for the outage-resiliency (Cache API) and non-FedCM backend-bridging (`fetch()` to internal endpoints) use cases described above.
 - No standard, isolated place to persist the IDP's augmentation code across sessions.
 
 #### Reason for rejection
@@ -345,9 +349,9 @@ This is a network-layer feature with **no UI surface of its own** and no user-vi
 
 ## Stakeholder Feedback / Opposition
 
-- **FedCM editors / WG** : Engaged. Resolved: dedicated event, relaxed response-type/cookie-scope invariants, `Sec-Fetch-Site` CSRF marker, `client_metadata` exclusion, and agreement that FedCM handler registrations live in a **UA-managed, isolated partition** (not colliding with, nor reachable by, the IDP's other Service Workers). Open: formally closing the registration-model alternatives (`acceptsFedCM` / `registration.identity`) in favor of the UA-only isolated key (see [Alternatives considered](#alternatives-considered)).
-- **Service Worker editors** : Cautious. Rejected reusing a client-less `FetchEvent` (foreign-fetch concerns) and asked for formal spec/security/privacy/TAG review, which shaped the dedicated-event direction. The "no controlling client" concern is addressed by framing dispatch as an explicit UA-only IDP→registration association rather than an implicit _Match Service Worker Registration_.
-- **Other browser engines** : No public signals yet.
+- **FedCM editors / WG**: Engaged. Resolved: dedicated event, relaxed response-type/cookie-scope invariants, `Sec-Fetch-Site` CSRF marker, `client_metadata` exclusion, and agreement that FedCM handler registrations live in a **UA-managed, isolated partition** (not colliding with, nor reachable by, the IDP's other Service Workers). Open: formally closing the registration-model alternatives (`acceptsFedCM` / `registration.identity`) in favor of the UA-only isolated key (see [Alternatives considered](#alternatives-considered)).
+- **Service Worker editors**: Cautious. Rejected reusing a client-less `FetchEvent` (foreign-fetch concerns) and asked for formal spec/security/privacy/TAG review, which shaped the dedicated-event direction. The "no controlling client" concern is addressed by framing dispatch as an explicit UA-only IDP→registration association rather than an implicit _Match Service Worker Registration_.
+- **Other browser engines**: No public signals yet.
 
 ## References & acknowledgements
 
